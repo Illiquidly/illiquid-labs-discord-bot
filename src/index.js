@@ -1,6 +1,6 @@
+"use strict";
 require("dotenv").config();
 
-const { WebSocketClient } = require("@terra-money/terra.js");
 const discord = require("discord.js");
 const { Observable, distinct } = require("rxjs");
 const { MessageEmbed, Intents } = require("discord.js");
@@ -14,6 +14,8 @@ const promiseRetry = require("promise-retry");
 const axios = require("axios");
 const { chunk } = require("lodash");
 const moment = require("moment");
+const { default: RPCWatcher } = require("./RPCWatcher");
+const { makeQueryParams } = require("./makeQueryParams");
 
 const wsClientsRPCs = process.env.RPC_URLS.split(",");
 
@@ -45,6 +47,8 @@ if (!RAFFLE_CONTRACT_ADDR) {
   throw new Error("No env RAFFLE_CONTRACT_ADDR provided!");
 }
 
+const RESTART_INTERVAL = 60000;
+
 const RAFFLE_ACTIONS = {
   modify_raffle: "Edited Raffle",
   create_raffle: "New Raffle",
@@ -53,18 +57,39 @@ const RAFFLE_ACTIONS = {
 };
 
 (() => {
-  const subscription = new Observable((subscriber) => {
-    wsClientsRPCs.forEach((url) => {
-      const wsClient = new WebSocketClient(url, -1);
+  let restartIndex = 0;
+  let watchers = [];
+  const subscription = new Observable(async (subscriber) => {
+    watchers = await Promise.all(
+      wsClientsRPCs.map(async (url) => {
+        const watcher = new RPCWatcher({
+          url: url.replace("http", "ws"),
+        });
 
-      wsClient.subscribeTx({ "wasm._contract_address": RAFFLE_CONTRACT_ADDR }, async (data) => {
-        const tx = data.value.TxResult;
+        watcher.registerSubscriber(
+          makeQueryParams({
+            "tm.event": "Tx",
+            "wasm._contract_address": RAFFLE_CONTRACT_ADDR,
+          }),
+          async (data) => {
+            const tx = data.result.data.value.TxResult;
 
-        subscriber.next(tx);
-      });
-      wsClient.start();
-    });
+            subscriber.next(tx);
+          }
+        );
+
+        await watcher.start();
+
+        return watcher;
+      })
+    );
   });
+
+  setInterval(() => {
+    // restart one RPC connection on at the time. Other should keep emitting.
+    watchers[restartIndex % watchers.length].restart();
+    restartIndex++;
+  }, RESTART_INTERVAL);
 
   subscription.pipe(distinct((tx) => tx.txhash)).subscribe(async (tx) => {
     const raffleTx = {
